@@ -1,3 +1,3 @@
 
-from .accountSerializer import AccountSerializer
-from .userSerializer import UserSerializer
+from .account import Account
+from .user import User
