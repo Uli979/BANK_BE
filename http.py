@@ -1,132 +1,401 @@
-"""
-Decorators for views based on HTTP headers.
-"""
+import base64
 import datetime
-from functools import wraps
+import re
+import unicodedata
+from binascii import Error as BinasciiError
+from email.utils import formatdate
+from urllib.parse import (
+    ParseResult,
+    SplitResult,
+    _coerce_args,
+    _splitnetloc,
+    _splitparams,
+    scheme_chars,
+)
+from urllib.parse import urlencode as original_urlencode
+from urllib.parse import uses_params
 
-from django.http import HttpResponseNotAllowed
-from django.middleware.http import ConditionalGetMiddleware
-from django.utils import timezone
-from django.utils.cache import get_conditional_response
-from django.utils.decorators import decorator_from_middleware
-from django.utils.http import http_date, quote_etag
-from django.utils.log import log_response
+from django.utils.datastructures import MultiValueDict
+from django.utils.regex_helper import _lazy_re_compile
 
-conditional_page = decorator_from_middleware(ConditionalGetMiddleware)
-
-
-def require_http_methods(request_method_list):
-    """
-    Decorator to make a view only accept particular request methods.  Usage::
-
-        @require_http_methods(["GET", "POST"])
-        def my_view(request):
-            # I can assume now that only GET or POST requests make it this far
-            # ...
-
-    Note that request methods should be in uppercase.
-    """
-
-    def decorator(func):
-        @wraps(func)
-        def inner(request, *args, **kwargs):
-            if request.method not in request_method_list:
-                response = HttpResponseNotAllowed(request_method_list)
-                log_response(
-                    "Method Not Allowed (%s): %s",
-                    request.method,
-                    request.path,
-                    response=response,
-                    request=request,
-                )
-                return response
-            return func(request, *args, **kwargs)
-
-        return inner
-
-    return decorator
-
-
-require_GET = require_http_methods(["GET"])
-require_GET.__doc__ = "Decorator to require that a view only accepts the GET method."
-
-require_POST = require_http_methods(["POST"])
-require_POST.__doc__ = "Decorator to require that a view only accepts the POST method."
-
-require_safe = require_http_methods(["GET", "HEAD"])
-require_safe.__doc__ = (
-    "Decorator to require that a view only accepts safe methods: GET and HEAD."
+# based on RFC 7232, Appendix C
+ETAG_MATCH = _lazy_re_compile(
+    r"""
+    \A(      # start of string and capture group
+    (?:W/)?  # optional weak indicator
+    "        # opening quote
+    [^"]*    # any sequence of non-quote characters
+    "        # end quote
+    )\Z      # end of string and capture group
+""",
+    re.X,
 )
 
+MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+__D = r"(?P<day>[0-9]{2})"
+__D2 = r"(?P<day>[ 0-9][0-9])"
+__M = r"(?P<mon>\w{3})"
+__Y = r"(?P<year>[0-9]{4})"
+__Y2 = r"(?P<year>[0-9]{2})"
+__T = r"(?P<hour>[0-9]{2}):(?P<min>[0-9]{2}):(?P<sec>[0-9]{2})"
+RFC1123_DATE = _lazy_re_compile(r"^\w{3}, %s %s %s %s GMT$" % (__D, __M, __Y, __T))
+RFC850_DATE = _lazy_re_compile(r"^\w{6,9}, %s-%s-%s %s GMT$" % (__D, __M, __Y2, __T))
+ASCTIME_DATE = _lazy_re_compile(r"^\w{3} %s %s %s %s$" % (__M, __D2, __T, __Y))
 
-def condition(etag_func=None, last_modified_func=None):
+RFC3986_GENDELIMS = ":/?#[]@"
+RFC3986_SUBDELIMS = "!$&'()*+,;="
+
+
+def urlencode(query, doseq=False):
     """
-    Decorator to support conditional retrieval (or change) for a view
-    function.
-
-    The parameters are callables to compute the ETag and last modified time for
-    the requested resource, respectively. The callables are passed the same
-    parameters as the view itself. The ETag function should return a string (or
-    None if the resource doesn't exist), while the last_modified function
-    should return a datetime object (or None if the resource doesn't exist).
-
-    The ETag function should return a complete ETag, including quotes (e.g.
-    '"etag"'), since that's the only way to distinguish between weak and strong
-    ETags. If an unquoted ETag is returned (e.g. 'etag'), it will be converted
-    to a strong ETag by adding quotes.
-
-    This decorator will either pass control to the wrapped view function or
-    return an HTTP 304 response (unmodified) or 412 response (precondition
-    failed), depending upon the request method. In either case, the decorator
-    will add the generated ETag and Last-Modified headers to the response if
-    the headers aren't already set and if the request's method is safe.
+    A version of Python's urllib.parse.urlencode() function that can operate on
+    MultiValueDict and non-string values.
     """
-
-    def decorator(func):
-        @wraps(func)
-        def inner(request, *args, **kwargs):
-            # Compute values (if any) for the requested resource.
-            def get_last_modified():
-                if last_modified_func:
-                    dt = last_modified_func(request, *args, **kwargs)
-                    if dt:
-                        if not timezone.is_aware(dt):
-                            dt = timezone.make_aware(dt, datetime.timezone.utc)
-                        return int(dt.timestamp())
-
-            # The value from etag_func() could be quoted or unquoted.
-            res_etag = etag_func(request, *args, **kwargs) if etag_func else None
-            res_etag = quote_etag(res_etag) if res_etag is not None else None
-            res_last_modified = get_last_modified()
-
-            response = get_conditional_response(
-                request,
-                etag=res_etag,
-                last_modified=res_last_modified,
+    if isinstance(query, MultiValueDict):
+        query = query.lists()
+    elif hasattr(query, "items"):
+        query = query.items()
+    query_params = []
+    for key, value in query:
+        if value is None:
+            raise TypeError(
+                "Cannot encode None for key '%s' in a query string. Did you "
+                "mean to pass an empty string or omit the value?" % key
             )
+        elif not doseq or isinstance(value, (str, bytes)):
+            query_val = value
+        else:
+            try:
+                itr = iter(value)
+            except TypeError:
+                query_val = value
+            else:
+                # Consume generators and iterators, when doseq=True, to
+                # work around https://bugs.python.org/issue31706.
+                query_val = []
+                for item in itr:
+                    if item is None:
+                        raise TypeError(
+                            "Cannot encode None for key '%s' in a query "
+                            "string. Did you mean to pass an empty string or "
+                            "omit the value?" % key
+                        )
+                    elif not isinstance(item, bytes):
+                        item = str(item)
+                    query_val.append(item)
+        query_params.append((key, query_val))
+    return original_urlencode(query_params, doseq)
 
-            if response is None:
-                response = func(request, *args, **kwargs)
 
-            # Set relevant headers on the response if they don't already exist
-            # and if the request method is safe.
-            if request.method in ("GET", "HEAD"):
-                if res_last_modified and not response.has_header("Last-Modified"):
-                    response.headers["Last-Modified"] = http_date(res_last_modified)
-                if res_etag:
-                    response.headers.setdefault("ETag", res_etag)
+def http_date(epoch_seconds=None):
+    """
+    Format the time to match the RFC1123 date format as specified by HTTP
+    RFC7231 section 7.1.1.1.
 
-            return response
+    `epoch_seconds` is a floating point number expressed in seconds since the
+    epoch, in UTC - such as that outputted by time.time(). If set to None, it
+    defaults to the current time.
 
-        return inner
-
-    return decorator
+    Output a string in the format 'Wdy, DD Mon YYYY HH:MM:SS GMT'.
+    """
+    return formatdate(epoch_seconds, usegmt=True)
 
 
-# Shortcut decorators for common cases based on ETag or Last-Modified only
-def etag(etag_func):
-    return condition(etag_func=etag_func)
+def parse_http_date(date):
+    """
+    Parse a date format as specified by HTTP RFC7231 section 7.1.1.1.
+
+    The three formats allowed by the RFC are accepted, even if only the first
+    one is still in widespread use.
+
+    Return an integer expressed in seconds since the epoch, in UTC.
+    """
+    # email.utils.parsedate() does the job for RFC1123 dates; unfortunately
+    # RFC7231 makes it mandatory to support RFC850 dates too. So we roll
+    # our own RFC-compliant parsing.
+    for regex in RFC1123_DATE, RFC850_DATE, ASCTIME_DATE:
+        m = regex.match(date)
+        if m is not None:
+            break
+    else:
+        raise ValueError("%r is not in a valid HTTP date format" % date)
+    try:
+        tz = datetime.timezone.utc
+        year = int(m["year"])
+        if year < 100:
+            current_year = datetime.datetime.now(tz=tz).year
+            current_century = current_year - (current_year % 100)
+            if year - (current_year % 100) > 50:
+                # year that appears to be more than 50 years in the future are
+                # interpreted as representing the past.
+                year += current_century - 100
+            else:
+                year += current_century
+        month = MONTHS.index(m["mon"].lower()) + 1
+        day = int(m["day"])
+        hour = int(m["hour"])
+        min = int(m["min"])
+        sec = int(m["sec"])
+        result = datetime.datetime(year, month, day, hour, min, sec, tzinfo=tz)
+        return int(result.timestamp())
+    except Exception as exc:
+        raise ValueError("%r is not a valid date" % date) from exc
 
 
-def last_modified(last_modified_func):
-    return condition(last_modified_func=last_modified_func)
+def parse_http_date_safe(date):
+    """
+    Same as parse_http_date, but return None if the input is invalid.
+    """
+    try:
+        return parse_http_date(date)
+    except Exception:
+        pass
+
+
+# Base 36 functions: useful for generating compact URLs
+
+
+def base36_to_int(s):
+    """
+    Convert a base 36 string to an int. Raise ValueError if the input won't fit
+    into an int.
+    """
+    # To prevent overconsumption of server resources, reject any
+    # base36 string that is longer than 13 base36 digits (13 digits
+    # is sufficient to base36-encode any 64-bit integer)
+    if len(s) > 13:
+        raise ValueError("Base36 input too large")
+    return int(s, 36)
+
+
+def int_to_base36(i):
+    """Convert an integer to a base36 string."""
+    char_set = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if i < 0:
+        raise ValueError("Negative base36 conversion input.")
+    if i < 36:
+        return char_set[i]
+    b36 = ""
+    while i != 0:
+        i, n = divmod(i, 36)
+        b36 = char_set[n] + b36
+    return b36
+
+
+def urlsafe_base64_encode(s):
+    """
+    Encode a bytestring to a base64 string for use in URLs. Strip any trailing
+    equal signs.
+    """
+    return base64.urlsafe_b64encode(s).rstrip(b"\n=").decode("ascii")
+
+
+def urlsafe_base64_decode(s):
+    """
+    Decode a base64 encoded string. Add back any trailing equal signs that
+    might have been stripped.
+    """
+    s = s.encode()
+    try:
+        return base64.urlsafe_b64decode(s.ljust(len(s) + len(s) % 4, b"="))
+    except (LookupError, BinasciiError) as e:
+        raise ValueError(e)
+
+
+def parse_etags(etag_str):
+    """
+    Parse a string of ETags given in an If-None-Match or If-Match header as
+    defined by RFC 7232. Return a list of quoted ETags, or ['*'] if all ETags
+    should be matched.
+    """
+    if etag_str.strip() == "*":
+        return ["*"]
+    else:
+        # Parse each ETag individually, and return any that are valid.
+        etag_matches = (ETAG_MATCH.match(etag.strip()) for etag in etag_str.split(","))
+        return [match[1] for match in etag_matches if match]
+
+
+def quote_etag(etag_str):
+    """
+    If the provided string is already a quoted ETag, return it. Otherwise, wrap
+    the string in quotes, making it a strong ETag.
+    """
+    if ETAG_MATCH.match(etag_str):
+        return etag_str
+    else:
+        return '"%s"' % etag_str
+
+
+def is_same_domain(host, pattern):
+    """
+    Return ``True`` if the host is either an exact match or a match
+    to the wildcard pattern.
+
+    Any pattern beginning with a period matches a domain and all of its
+    subdomains. (e.g. ``.example.com`` matches ``example.com`` and
+    ``foo.example.com``). Anything else is an exact string match.
+    """
+    if not pattern:
+        return False
+
+    pattern = pattern.lower()
+    return (
+        pattern[0] == "."
+        and (host.endswith(pattern) or host == pattern[1:])
+        or pattern == host
+    )
+
+
+def url_has_allowed_host_and_scheme(url, allowed_hosts, require_https=False):
+    """
+    Return ``True`` if the url uses an allowed host and a safe scheme.
+
+    Always return ``False`` on an empty url.
+
+    If ``require_https`` is ``True``, only 'https' will be considered a valid
+    scheme, as opposed to 'http' and 'https' with the default, ``False``.
+
+    Note: "True" doesn't entail that a URL is "safe". It may still be e.g.
+    quoted incorrectly. Ensure to also use django.utils.encoding.iri_to_uri()
+    on the path component of untrusted URLs.
+    """
+    if url is not None:
+        url = url.strip()
+    if not url:
+        return False
+    if allowed_hosts is None:
+        allowed_hosts = set()
+    elif isinstance(allowed_hosts, str):
+        allowed_hosts = {allowed_hosts}
+    # Chrome treats \ completely as / in paths but it could be part of some
+    # basic auth credentials so we need to check both URLs.
+    return _url_has_allowed_host_and_scheme(
+        url, allowed_hosts, require_https=require_https
+    ) and _url_has_allowed_host_and_scheme(
+        url.replace("\\", "/"), allowed_hosts, require_https=require_https
+    )
+
+
+# Copied from urllib.parse.urlparse() but uses fixed urlsplit() function.
+def _urlparse(url, scheme="", allow_fragments=True):
+    """Parse a URL into 6 components:
+    <scheme>://<netloc>/<path>;<params>?<query>#<fragment>
+    Return a 6-tuple: (scheme, netloc, path, params, query, fragment).
+    Note that we don't break the components up in smaller bits
+    (e.g. netloc is a single string) and we don't expand % escapes."""
+    url, scheme, _coerce_result = _coerce_args(url, scheme)
+    splitresult = _urlsplit(url, scheme, allow_fragments)
+    scheme, netloc, url, query, fragment = splitresult
+    if scheme in uses_params and ";" in url:
+        url, params = _splitparams(url)
+    else:
+        params = ""
+    result = ParseResult(scheme, netloc, url, params, query, fragment)
+    return _coerce_result(result)
+
+
+# Copied from urllib.parse.urlsplit() with
+# https://github.com/python/cpython/pull/661 applied.
+def _urlsplit(url, scheme="", allow_fragments=True):
+    """Parse a URL into 5 components:
+    <scheme>://<netloc>/<path>?<query>#<fragment>
+    Return a 5-tuple: (scheme, netloc, path, query, fragment).
+    Note that we don't break the components up in smaller bits
+    (e.g. netloc is a single string) and we don't expand % escapes."""
+    url, scheme, _coerce_result = _coerce_args(url, scheme)
+    netloc = query = fragment = ""
+    i = url.find(":")
+    if i > 0:
+        for c in url[:i]:
+            if c not in scheme_chars:
+                break
+        else:
+            scheme, url = url[:i].lower(), url[i + 1 :]
+
+    if url[:2] == "//":
+        netloc, url = _splitnetloc(url, 2)
+        if ("[" in netloc and "]" not in netloc) or (
+            "]" in netloc and "[" not in netloc
+        ):
+            raise ValueError("Invalid IPv6 URL")
+    if allow_fragments and "#" in url:
+        url, fragment = url.split("#", 1)
+    if "?" in url:
+        url, query = url.split("?", 1)
+    v = SplitResult(scheme, netloc, url, query, fragment)
+    return _coerce_result(v)
+
+
+def _url_has_allowed_host_and_scheme(url, allowed_hosts, require_https=False):
+    # Chrome considers any URL with more than two slashes to be absolute, but
+    # urlparse is not so flexible. Treat any url with three slashes as unsafe.
+    if url.startswith("///"):
+        return False
+    try:
+        url_info = _urlparse(url)
+    except ValueError:  # e.g. invalid IPv6 addresses
+        return False
+    # Forbid URLs like http:///example.com - with a scheme, but without a hostname.
+    # In that URL, example.com is not the hostname but, a path component. However,
+    # Chrome will still consider example.com to be the hostname, so we must not
+    # allow this syntax.
+    if not url_info.netloc and url_info.scheme:
+        return False
+    # Forbid URLs that start with control characters. Some browsers (like
+    # Chrome) ignore quite a few control characters at the start of a
+    # URL and might consider the URL as scheme relative.
+    if unicodedata.category(url[0])[0] == "C":
+        return False
+    scheme = url_info.scheme
+    # Consider URLs without a scheme (e.g. //example.com/p) to be http.
+    if not url_info.scheme and url_info.netloc:
+        scheme = "http"
+    valid_schemes = ["https"] if require_https else ["http", "https"]
+    return (not url_info.netloc or url_info.netloc in allowed_hosts) and (
+        not scheme or scheme in valid_schemes
+    )
+
+
+def escape_leading_slashes(url):
+    """
+    If redirecting to an absolute path (two leading slashes), a slash must be
+    escaped to prevent browsers from handling the path as schemaless and
+    redirecting to another host.
+    """
+    if url.startswith("//"):
+        url = "/%2F{}".format(url[2:])
+    return url
+
+
+def _parseparam(s):
+    while s[:1] == ";":
+        s = s[1:]
+        end = s.find(";")
+        while end > 0 and (s.count('"', 0, end) - s.count('\\"', 0, end)) % 2:
+            end = s.find(";", end + 1)
+        if end < 0:
+            end = len(s)
+        f = s[:end]
+        yield f.strip()
+        s = s[end:]
+
+
+def parse_header_parameters(line):
+    """
+    Parse a Content-type like header.
+    Return the main content-type and a dictionary of options.
+    """
+    parts = _parseparam(";" + line)
+    key = parts.__next__()
+    pdict = {}
+    for p in parts:
+        i = p.find("=")
+        if i >= 0:
+            name = p[:i].strip().lower()
+            value = p[i + 1 :].strip()
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                value = value[1:-1]
+                value = value.replace("\\\\", "\\").replace('\\"', '"')
+            pdict[name] = value
+    return key, pdict
