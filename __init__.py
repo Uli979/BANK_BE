@@ -1,2 +1,3 @@
-from .userCreateView import UserCreateView
-from .userDetailView import UserDetailView
+
+from .accountSerializer import AccountSerializer
+from .userSerializer import UserSerializer
